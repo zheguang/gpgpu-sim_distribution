@@ -1517,6 +1517,36 @@ void cnot_impl( const ptx_instruction *pI, ptx_thread_info *thread )
    thread->set_operand_value(dst,d, i_type, thread, pI);
 }
 
+static double sin_cheby_reg(double x)
+{
+    //-1.047e-1 + x * 1.749 + x.^2 * -8.191e-1 + x.^3 * 8.691e-2 + x.^4 * -3.390e-156;
+    static const
+    double a0 =  -1.047e-1,
+            a1 = 1.749,
+            a2 =  -8.191e-1,
+            a3 =  8.691e-2,
+            a4 =  -3.390e-156;
+    return a0 + x * (a1 + x * (a2 + x * (a3 + x * a4)));
+}
+
+static double sin_cheby_odd(double x)
+{
+    //x * 9.886e-1 + x.^3 * -1.605e-1 + x.^5 * 7.410e-3 + x.^7 * -1.396e-4 + x.^9 * 9.846e-7;
+    static const
+    double a1 =  9.886e-1,
+            a3 = -1.605e-1,
+            a5 =  7.410e-3,
+            a7 =  -1.396e-4,
+            a9 =  9.846e-7;
+    double x2 = x * x;
+    return x * (a1 + x2 * (a3 + x2 * (a5 + x2 * (a7 + x2 * a9))));
+}
+
+static double normalize_to_2pi(double x)
+{
+    return fmod(x, 2 * M_PI);
+}
+
 void cos_impl( const ptx_instruction *pI, ptx_thread_info *thread ) 
 {
    ptx_reg_t a, d;
@@ -1529,7 +1559,8 @@ void cos_impl( const ptx_instruction *pI, ptx_thread_info *thread )
 
    switch ( i_type ) {
    case F32_TYPE: 
-      d.f32 = cos(a.f32);
+      //d.f32 = cos(a.f32);
+           d.f32 = (float) sin_cheby_odd(normalize_to_2pi(a.f32 + M_PI_2));
       break;
    default:
       printf("Execution error: type mismatch with instruction\n");
@@ -2715,18 +2746,42 @@ void mul24_impl( const ptx_instruction *pI, ptx_thread_info *thread )
    //src1_data = srcOperandModifiers(src1_data, src1, dst, i_type, thread);
    //src2_data = srcOperandModifiers(src2_data, src2, dst, i_type, thread);
 
+    /// Clear upper 32 bits
    src1_data.mask_and(0,0x00FFFFFF);
    src2_data.mask_and(0,0x00FFFFFF);
 
    switch ( i_type ) {
-   case S32_TYPE: 
-      if( src1_data.get_bit(23) ) 
-         src1_data.mask_or(0xFFFFFFFF,0xFF000000);
-      if( src2_data.get_bit(23) ) 
-         src2_data.mask_or(0xFFFFFFFF,0xFF000000);
-      data.s64 = src1_data.s64 * src2_data.s64;
-      break;
+   case S32_TYPE: {
+       // Check sign bit, if negative, set upper bits to be 1.
+       if( src1_data.get_bit(23) )
+           src1_data.mask_or(0xFFFFFFFF,0xFF000000); // set upper bits
+       if( src2_data.get_bit(23) )
+           src2_data.mask_or(0xFFFFFFFF,0xFF000000); // set upper bits
+       //data.s64 = src1_data.s64 * src2_data.s64;
+
+       //printf("[debug] S32_TYPE mul24");
+
+       int Sa = src1_data.get_bit(23);
+       unsigned mssb1 = sizeof(data.s64) * 8 - __builtin_clz(src1_data.s64 & (1 << 24 - 1));
+       int expa = src1_data.get_bit(mssb1);
+       float Ma = (src1_data.s64 - (1 << mssb1)) / (float) src1_data.s64;
+
+       int Sb = src2_data.get_bit(23);
+       unsigned mssb2 = sizeof(data.s64) * 8 - __builtin_clz(src2_data.s64 & (1 << 24 - 1));
+       int expb = src1_data.get_bit(mssb2);
+       float Mb = (src1_data.s64 - (1 << mssb2)) / (float) src1_data.s64;
+
+       int Sz = Sa ^ Sb;
+       int cin = Ma + Mb < 1 ? 0 : 1;
+       int expz = expa + expb + cin;
+       float Mz = (Ma + Mb < 1) ? (1 + Ma + Mb) : ((1 + Ma + Mb) / 2);
+       long long int z_approx = (long long int) ((Sz == 1 ? -1 : 1) * (1 << expz) * Mz);
+
+       data.s64 = z_approx;
+       break;
+   }
    case U32_TYPE:
+       //printf("[debug] U32_TYPE mul24");
       data.u64 = src1_data.u64 * src2_data.u64;
       break;
    default:
@@ -2737,9 +2792,9 @@ void mul24_impl( const ptx_instruction *pI, ptx_thread_info *thread )
 
    if ( pI->is_hi() ) {
       data.u64 = data.u64 >> 16;
-      data.mask_and(0,0xFFFFFFFF);
+      data.mask_and(0,0xFFFFFFFF); // clear upper bits
    } else if (pI->is_lo()) {
-      data.mask_and(0,0xFFFFFFFF);
+      data.mask_and(0,0xFFFFFFFF); // clear upper bits
    }
 
    thread->set_operand_value(dst, data, i_type, thread, pI);
@@ -2761,52 +2816,60 @@ void mul_impl( const ptx_instruction *pI, ptx_thread_info *thread )
    unsigned rounding_mode = pI->rounding_mode();
 
    switch ( i_type ) {
-   case S16_TYPE: 
+   case S16_TYPE:
+       //printf("[debug] mul S16_TYPE");
       t.s32 = ((int)a.s16) * ((int)b.s16);
       if ( pI->is_wide() ) d.s32 = t.s32;
       else if ( pI->is_hi() ) d.s16 = (t.s32>>16);
       else if ( pI->is_lo() ) d.s16 = t.s16;
       else assert(0);
       break;
-   case S32_TYPE: 
+   case S32_TYPE:
+       //printf("[debug] mul S32_TYPE");
       t.s64 = ((long long)a.s32) * ((long long)b.s32);
       if ( pI->is_wide() ) d.s64 = t.s64;
       else if ( pI->is_hi() ) d.s32 = (t.s64>>32);
       else if ( pI->is_lo() ) d.s32 = t.s32;
       else assert(0);
       break;
-   case S64_TYPE: 
+   case S64_TYPE:
+       //printf("[debug] mul S64_TYPE");
       t.s64 = a.s64 * b.s64;
       assert( !pI->is_wide() );
       assert( !pI->is_hi() );
       if ( pI->is_lo() ) d.s64 = t.s64;
       else assert(0);
       break;
-   case U16_TYPE: 
+   case U16_TYPE:
+       //printf("[debug] mul U16_TYPE");
       t.u32 = ((unsigned)a.u16) * ((unsigned)b.u16);
       if ( pI->is_wide() ) d.u32 = t.u32;
       else if ( pI->is_lo() ) d.u16 = t.u16;
       else if ( pI->is_hi() ) d.u16 = (t.u32>>16);
       else assert(0);
       break;
-   case U32_TYPE: 
+   case U32_TYPE:
+       //printf("[debug] mul U32_TYPE");
       t.u64 = ((unsigned long long)a.u32) * ((unsigned long long)b.u32);
       if ( pI->is_wide() ) d.u64 = t.u64;
       else if ( pI->is_lo() ) d.u32 = t.u32;
       else if ( pI->is_hi() ) d.u32 = (t.u64>>32);
       else assert(0);
       break;
-   case U64_TYPE: 
+   case U64_TYPE:
+       //printf("[debug] mul U64_TYPE");
       t.u64 = a.u64 * b.u64;
       assert( !pI->is_wide() );
       assert( !pI->is_hi() );
       if ( pI->is_lo() ) d.u64 = t.u64;
       else assert(0);
       break;
-   case F16_TYPE: 
-      assert(0); 
+   case F16_TYPE:
+       //printf("[debug] mul F16_TYPE");
+      assert(0);
       break;
    case F32_TYPE: {
+       //printf("[debug] mul F32_TYPE");
          int orig_rm = fegetround();
          switch ( rounding_mode ) {
          case RN_OPTION: break;
@@ -2824,6 +2887,7 @@ void mul_impl( const ptx_instruction *pI, ptx_thread_info *thread )
          break;
       }  
    case F64_TYPE: case FF64_TYPE:{
+       //printf("[debug] mul F64_TYPE FF64_TYPE");
          int orig_rm = fegetround();
          switch ( rounding_mode ) {
          case RN_OPTION: break;
@@ -3559,8 +3623,10 @@ void shr_impl( const ptx_instruction *pI, ptx_thread_info *thread )
    thread->set_operand_value(dst,d, i_type, thread, pI);
 }
 
-void sin_impl( const ptx_instruction *pI, ptx_thread_info *thread ) 
+
+void sin_impl( const ptx_instruction *pI, ptx_thread_info *thread )
 {
+    printf("[debug]: sin_imp");
    ptx_reg_t a, d;
    const operand_info &dst  = pI->dst();
    const operand_info &src1 = pI->src1();
@@ -3571,7 +3637,8 @@ void sin_impl( const ptx_instruction *pI, ptx_thread_info *thread )
 
    switch ( i_type ) {
    case F32_TYPE: 
-      d.f32 = sin(a.f32);
+      //d.f32 = sin(a.f32);
+       d.f32 = (float) sin_cheby_odd(normalize_to_2pi(a.f32));
       break;
    default:
       printf("Execution error: type mismatch with instruction\n");

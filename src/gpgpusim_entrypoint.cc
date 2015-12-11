@@ -128,6 +128,7 @@ void *gpgpu_sim_thread_concurrent(void*)
                 break;
 
             if( g_the_gpu->active() ) {
+                // Executed when in performance simulation mode
                 g_the_gpu->cycle();
                 sim_cycles = true;
                 g_the_gpu->deadlock_check();
