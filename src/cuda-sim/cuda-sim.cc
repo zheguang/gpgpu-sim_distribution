@@ -763,7 +763,14 @@ void ptx_instruction::set_opcode_and_latency()
 		   break;
 	   }
 	   break;
-   case SQRT_OP: case SIN_OP: case COS_OP: case EX2_OP: case LG2_OP: case RSQRT_OP: case RCP_OP:
+   case SIN_OP: case COS_OP:
+       //Using float to approximate those
+       latency = fp_latency[2];
+       initiation_interval = fp_init[2];
+       op = SFU_OP;
+       break;
+   //case SQRT_OP: case SIN_OP: case COS_OP: case EX2_OP: case LG2_OP: case RSQRT_OP: case RCP_OP:
+   case SQRT_OP: case EX2_OP: case LG2_OP: case RSQRT_OP: case RCP_OP:
 	   //Using double to approximate those
 	  latency = dp_latency[2];
 	  initiation_interval = dp_init[2];
